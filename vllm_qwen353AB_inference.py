@@ -4,7 +4,7 @@ import time
 
 import modal
 
-MODEL_NAME = "cyankiwi/Qwen3.5-35B-A3B-AWQ-4bit"
+MODEL_NAME = "cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit"
 MODEL_PATH = "/model"
 
 
@@ -59,7 +59,7 @@ vllm_image = (
     .run_function(download_model, secrets=[modal.Secret.from_name("hf-secret")])
 )
 
-app = modal.App("example-qwen3-5-awq-inference")
+app = modal.App("example-qwen3-6-35b-a3b-awq-inference")
 
 VLLM_PORT = 8000
 MINUTES = 60
@@ -67,8 +67,8 @@ MINUTES = 60
 
 @app.cls(
     image=vllm_image,
-    gpu="A100-40GB", 
-    scaledown_window=180, 
+    gpu="L40S", 
+    scaledown_window=480, 
     timeout=40 * MINUTES,
     secrets=[modal.Secret.from_name("hf-secret")],
     enable_memory_snapshot=True,
@@ -91,7 +91,7 @@ class VllmServer:
     def start(self):
         import requests
 
-        cmd =[
+        cmd = [
             "vllm",
             "serve",
             MODEL_PATH,
@@ -102,20 +102,27 @@ class VllmServer:
             "--port",
             str(VLLM_PORT),
             "--max-model-len",
-            "16384",
+            "32768",
             "--gpu-memory-utilization",
-            "0.85",
+            "0.9",
             "--mamba-cache-mode",
             "align",
             "--mamba-block-size",
             "8",
             "--max-num-batched-tokens",
-            "4096",
+            "2096",
             "--block-size",
             "32",
+            "--max-num-seqs",
+            "8",
             "--enable-prefix-caching",
+            "--enable-auto-tool-choice",
+            "--reasoning-parser",
+            "qwen3",
+            "--tool-call-parser",
+            "qwen3_coder",
             "--disable-custom-all-reduce",
-            "--default-chat-template-kwargs", '{"enable_thinking": true}',
+            "--language-model-only",
             "--trust-remote-code",
             "--disable-log-stats",
             "--enable-sleep-mode",

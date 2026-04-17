@@ -4,7 +4,7 @@ import time
 
 import modal
 
-MODEL_NAME = "cyankiwi/Qwen3.5-4B-AWQ-4bit"
+MODEL_NAME = "zai-org/GLM-OCR"
 MODEL_PATH = "/model"
 
 
@@ -16,7 +16,7 @@ def download_model():
     snapshot_download(
         MODEL_NAME,
         local_dir=MODEL_PATH,
-        ignore_patterns=["*.pt", "*.bin"],
+        ignore_patterns=["*.pt", "*.bin"],  # Ignore PyTorch state dicts to save space
     )
 
 
@@ -25,11 +25,14 @@ vllm_image = (
         "nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12"
     )
     .entrypoint([])
-    .uv_pip_install(
-        "vllm>=0.19.0",
-        "transformers>=4.56.0,<5",
-        "requests",
-        "huggingface_hub[hf_transfer]",
+    .apt_install("git")  # ✨ ADDED: Install git so uv can pull from GitHub
+    .pip_install("uv")
+    .run_commands(
+        # Install the nightly build of vLLM for GLM-OCR
+        "uv pip install --system -U vllm --pre --extra-index-url https://wheels.vllm.ai/nightly",
+        # Install transformers from source for >= 5.0.0 compatibility
+        "uv pip install --system git+https://github.com/huggingface/transformers.git",
+        "uv pip install --system requests huggingface_hub[hf_transfer]"
     )
     .env(
         {
@@ -37,29 +40,19 @@ vllm_image = (
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "VLLM_CACHE_ROOT": "/cache/vllm",
             "TRITON_CACHE_DIR": "/cache/triton",
-            
-            # Disable NCCL heartbeat monitor
             "TORCH_NCCL_ENABLE_MONITORING": "0",
             "TORCH_NCCL_ASYNC_ERROR_HANDLING": "0",
-            
-            # Use spawn to avoid inheriting stale sockets
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-            # Single GPU – disable peer-to-peer
             "NCCL_P2P_DISABLE": "1",
-            # Required for sleep/wake endpoints
             "VLLM_SERVER_DEV_MODE": "1",
-            # Reduce NCCL verbosity
             "NCCL_DEBUG": "OFF",
-            
-            # ✨ ADD THIS: Force internal vLLM/PyTorch Distributed sockets to use localhost.
-            # This prevents broken pipes when memory snapshots are restored on containers with new IPs.
             "VLLM_HOST_IP": "127.0.0.1",
         }
     )
     .run_function(download_model, secrets=[modal.Secret.from_name("hf-secret")])
 )
 
-app = modal.App("example-qwen3-5-4b-awq-inference")
+app = modal.App("example-glm-ocr-mtp-inference")
 
 VLLM_PORT = 8000
 MINUTES = 60
@@ -67,7 +60,7 @@ MINUTES = 60
 
 @app.cls(
     image=vllm_image,
-    gpu="T4", 
+    gpu="T4",  # Downscaled to cost-effective T4
     scaledown_window=180, 
     timeout=40 * MINUTES,
     secrets=[modal.Secret.from_name("hf-secret")],
@@ -103,35 +96,56 @@ class VllmServer:
             str(VLLM_PORT),
             "--max-model-len",
             "8192",
-            "--gpu-memory-utilization",
-            "0.9",
-            "--mamba-cache-mode",
-            "align",
-            "--mamba-block-size",
-            "8",
-            "--max-num-batched-tokens",
-            "4096",
-            "--block-size",
-            "32",
-            "--enable-prefix-caching",
-            "--mm-processor-cache-type", "shm",
-            "--disable-custom-all-reduce",
-            "--default-chat-template-kwargs", '{"enable_thinking": false}',
+            
+            # --- MEMORY FIXES FOR T4 ---
+            "--gpu-memory-utilization", "0.80",  # Lowered from 0.9 to free up VRAM
+            "--max-num-seqs", "16",              # Lowered from default 256 to prevent OOM
+            
+            # --- T4 Compatibility ---
+            "--dtype", "half", # Force float16. T4 does not support bfloat16.
             "--trust-remote-code",
             "--disable-log-stats",
             "--enable-sleep-mode",
+            
+            # --- GLM-OCR MTP Decoding Flags ---
+            "--speculative-config.method", "mtp",
+            "--speculative-config.num_speculative_tokens", "1",
         ]
 
         print("Starting vLLM server...")
         self.process = subprocess.Popen(cmd)
 
         self.wait_ready()
-        print("vLLM is up! Warming up...")
+        print("vLLM is up! Warming up multimodal endpoints...")
+        
+        # ... rest of your code ...
+        self.process = subprocess.Popen(cmd)
 
+        self.wait_ready()
+        print("vLLM is up! Warming up multimodal endpoints...")
+
+        # Warmup payload with an image to compile the vision components
         warmup_payload = {
             "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "hi"}],
+            "messages":[
+                {
+                    "role": "user",
+                    "content":[
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "https://ofasys-multimodal-wlcb-3-toshanghai.oss-accelerate.aliyuncs.com/wpf272043/keepme/image/receipt.png"
+                            }
+                        },
+                        {
+                            "type": "text",
+                            "text": "Text Recognition:"
+                        }
+                    ]
+                }
+            ],
             "max_tokens": 5,
+            "temperature": 0.0
         }
         try:
             requests.post(
