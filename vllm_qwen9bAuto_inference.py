@@ -3,7 +3,7 @@ import subprocess
 import time
 import modal
 
-MODEL_NAME = "cyankiwi/Qwen3.5-4B-AWQ-4bit"
+MODEL_NAME = "Intel/Qwen3.5-9B-int4-AutoRound"
 MODEL_PATH = "/model"
 
 def download_model():
@@ -22,18 +22,23 @@ vllm_image = (
         "nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12"
     )
     .entrypoint([])
+    # 1. Install vLLM and other dependencies first
     .uv_pip_install(
         "vllm>=0.19.0",
-        "transformers>=4.56.0,<5",
         "requests",
         "huggingface_hub[hf_transfer]",
+    )
+    # 2. Force-upgrade transformers to v5+ in a separate layer 
+    # to bypass vLLM's <5.0 dependency resolution constraints
+    .uv_pip_install(
+        "transformers>=5.0.0"
     )
     .env(
         {
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "VLLM_CACHE_ROOT": "/cache/vllm",
-            "TRITON_CACHE_DIR": "/tmp/triton",      # Fixed: moved off volume to prevent snapshot restore failure
+            "TRITON_CACHE_DIR": "/tmp/triton",      
             "TORCH_NCCL_ENABLE_MONITORING": "0",
             "TORCH_NCCL_ASYNC_ERROR_HANDLING": "0",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -50,19 +55,18 @@ vllm_image = (
     )
     .run_function(download_model, secrets=[modal.Secret.from_name("hf-secret")])
 )
-
-app = modal.App("example-qwen3-5-4b-awq-inference")
+app = modal.App("example-qwen3-5-9b-awq-inference")
 
 # Persists torch.compile cache across cold starts — saves ~155s per boot
-cache_vol = modal.Volume.from_name("vllm-compile-cache2", create_if_missing=True)
+cache_vol = modal.Volume.from_name("vllm-compile-cache", create_if_missing=True)
 
 VLLM_PORT = 8000
 MINUTES = 60
 
 @app.cls(
     image=vllm_image,
-    gpu="T4",
-    scaledown_window=240,
+    gpu="L4",
+    scaledown_window=360,
     timeout=40 * MINUTES,
     secrets=[modal.Secret.from_name("hf-secret")],
     enable_memory_snapshot=True,
@@ -101,7 +105,7 @@ class VllmServer:
             "--kv-cache-dtype",
             "fp8",
             "--max-model-len",
-            "16384",
+            "32768",
             "--gpu-memory-utilization",
             "0.9156",               # Bumped per vLLM recommendation with CUDAGRAPHS estimator enabled
             "--mamba-cache-mode",
@@ -115,17 +119,19 @@ class VllmServer:
             "--max-num-seqs",
             "8",
             "--enable-prefix-caching",
-            "--enable-auto-tool-choice",
-            "--tool-call-parser",
-            "qwen3_coder",
             "--generation-config",
             "vllm",                 # Prevents model's generation_config.json from overriding sampling params
             "--disable-custom-all-reduce",
             "--default-chat-template-kwargs", '{"enable_thinking": false}',
-          "--mm-processor-cache-type", "shm",
+            "--language-model-only",
+            "--enable-chunked-prefill",
             "--trust-remote-code",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser",
+            "qwen3_coder",
             "--disable-log-stats",
-            "--enable-sleep-mode",
+  
+
             # Removed --speculative-config: was forcing PIECEWISE cuda graph mode downgrade
             # Removed --reasoning-parser: disabled thinking mode
         ]

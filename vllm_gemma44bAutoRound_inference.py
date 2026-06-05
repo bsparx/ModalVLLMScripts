@@ -3,7 +3,7 @@ import subprocess
 import time
 import modal
 
-MODEL_NAME = "cyankiwi/Qwen3.5-4B-AWQ-4bit"
+MODEL_NAME = "cyankiwi/gemma-4-E4B-it-AWQ-INT4"
 MODEL_PATH = "/model"
 
 def download_model():
@@ -21,11 +21,15 @@ vllm_image = (
     modal.Image.from_registry(
         "nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.12"
     )
+    .apt_install("ffmpeg", "libsndfile1")
     .entrypoint([])
     .uv_pip_install(
-        "vllm>=0.19.0",
-        "transformers>=4.56.0,<5",
+        "vllm[audio]>=0.19.1",
+        "transformers>=5.5.0",
         "requests",
+        "soundfile",
+        "librosa",
+        "av",
         "huggingface_hub[hf_transfer]",
     )
     .env(
@@ -33,7 +37,7 @@ vllm_image = (
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "VLLM_CACHE_ROOT": "/cache/vllm",
-            "TRITON_CACHE_DIR": "/tmp/triton",      # Fixed: moved off volume to prevent snapshot restore failure
+            "TRITON_CACHE_DIR": "/tmp/triton",
             "TORCH_NCCL_ENABLE_MONITORING": "0",
             "TORCH_NCCL_ASYNC_ERROR_HANDLING": "0",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
@@ -44,25 +48,30 @@ vllm_image = (
             "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "1",
         }
     )
-    # FIX: Patch vLLM to handle Mamba state (lists) during FP8 KV cache initialization on wake-up
     .run_commands(
-        'python -c \'import sys; f="/usr/local/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py"; c=open(f).read(); c=c.replace("cache_tensor.zero_()", "[t.zero_() for t in cache_tensor if t is not None] if isinstance(cache_tensor, (list, tuple)) else cache_tensor.zero_()"); open(f,"w").write(c)\''
+        # 1. Patch the vLLM gpu_model_runner cache bug
+        'python -c \'import sys; f="/usr/local/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py"; c=open(f).read(); c=c.replace("cache_tensor.zero_()", "[t.zero_() for t in cache_tensor if t is not None] if isinstance(cache_tensor, (list, tuple)) else cache_tensor.zero_()"); open(f,"w").write(c)\'',
+
+        # 2. Expand the audio mask to the TRUE length of the sequence
+        'python -c \'import sys; f="/usr/local/lib/python3.12/site-packages/transformers/models/gemma4/modeling_gemma4.py"; c=open(f).read(); c=c.replace("hidden_states = hidden_states * mask[:, None, :, None]", "mask = torch.ones(hidden_states.shape[0], hidden_states.shape[2], dtype=torch.bool, device=hidden_states.device) if mask.dim() == 1 else mask; hidden_states = hidden_states * mask[:, None, :, None]"); open(f,"w").write(c)\'',
+
+        # 3. FIX: Cast audio encodings to match embed_audio weight dtype (bfloat16 vs float16 mismatch)
+        'python -c \'import sys; f="/usr/local/lib/python3.12/site-packages/vllm/model_executor/models/gemma4_mm.py"; c=open(f).read(); c=c.replace("audio_features = self.embed_audio(inputs_embeds=audio_encodings)", "audio_features = self.embed_audio(inputs_embeds=audio_encodings.to(next(self.embed_audio.parameters()).dtype))"); open(f,"w").write(c)\'',
     )
     .run_function(download_model, secrets=[modal.Secret.from_name("hf-secret")])
 )
 
-app = modal.App("example-qwen3-5-4b-awq-inference")
+app = modal.App("example-gemma-4-e2b-Autoround-it-inference")
 
-# Persists torch.compile cache across cold starts — saves ~155s per boot
-cache_vol = modal.Volume.from_name("vllm-compile-cache2", create_if_missing=True)
+cache_vol = modal.Volume.from_name("vllm-compile-cache6", create_if_missing=True)
 
 VLLM_PORT = 8000
 MINUTES = 60
 
 @app.cls(
     image=vllm_image,
-    gpu="T4",
-    scaledown_window=240,
+    gpu="L4",
+    scaledown_window=360,
     timeout=40 * MINUTES,
     secrets=[modal.Secret.from_name("hf-secret")],
     enable_memory_snapshot=True,
@@ -96,38 +105,31 @@ class VllmServer:
             "0.0.0.0",
             "--port",
             str(VLLM_PORT),
-            "--dtype",
-            "half",
+            "--max-model-len",
+            "32768",
             "--kv-cache-dtype",
             "fp8",
-            "--max-model-len",
-            "16384",
             "--gpu-memory-utilization",
-            "0.9156",               # Bumped per vLLM recommendation with CUDAGRAPHS estimator enabled
-            "--mamba-cache-mode",
-            "align",
-            "--mamba-block-size",
-            "16",                   # Was 8 — reduces 10% KV cache padding waste
+            "0.85",
             "--max-num-batched-tokens",
-            "4096",                 # Must be >= block_size (2096) in mamba align mode
+            "4096",
             "--block-size",
             "32",
             "--max-num-seqs",
             "8",
+            "--reasoning-parser","gemma4",
             "--enable-prefix-caching",
-            "--enable-auto-tool-choice",
-            "--tool-call-parser",
-            "qwen3_coder",
             "--generation-config",
-            "vllm",                 # Prevents model's generation_config.json from overriding sampling params
+            "vllm",
             "--disable-custom-all-reduce",
-            "--default-chat-template-kwargs", '{"enable_thinking": false}',
-          "--mm-processor-cache-type", "shm",
             "--trust-remote-code",
             "--disable-log-stats",
             "--enable-sleep-mode",
-            # Removed --speculative-config: was forcing PIECEWISE cuda graph mode downgrade
-            # Removed --reasoning-parser: disabled thinking mode
+            "--enable-chunked-prefill",
+            "--async-scheduling",
+            "--default-chat-template-kwargs", '{"enable_thinking": false}',
+            "--limit-mm-per-prompt", '{"image": 0, "audio": 1}',
+            "--speculative-config", '{"model":"google/gemma-4-E4B-it-assistant","num_speculative_tokens":2}'
         ]
 
         print("Starting vLLM server...")

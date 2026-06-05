@@ -1,12 +1,10 @@
 import socket
 import subprocess
 import time
-
 import modal
 
-MODEL_NAME = "QuantTrio/Qwen3.5-9B-AWQ"
+MODEL_NAME = "cyankiwi/Qwen3.5-9B-AWQ-4bit"
 MODEL_PATH = "/model"
-
 
 def download_model():
     from huggingface_hub import snapshot_download
@@ -18,7 +16,6 @@ def download_model():
         local_dir=MODEL_PATH,
         ignore_patterns=["*.pt", "*.bin"],
     )
-
 
 vllm_image = (
     modal.Image.from_registry(
@@ -36,43 +33,41 @@ vllm_image = (
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "VLLM_CACHE_ROOT": "/cache/vllm",
-            "TRITON_CACHE_DIR": "/cache/triton",
-            
-            # Disable NCCL heartbeat monitor
+            "TRITON_CACHE_DIR": "/tmp/triton",      # Fixed: moved off volume to prevent snapshot restore failure
             "TORCH_NCCL_ENABLE_MONITORING": "0",
             "TORCH_NCCL_ASYNC_ERROR_HANDLING": "0",
-            
-            # Use spawn to avoid inheriting stale sockets
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
-            # Single GPU – disable peer-to-peer
             "NCCL_P2P_DISABLE": "1",
-            # Required for sleep/wake endpoints
             "VLLM_SERVER_DEV_MODE": "1",
-            # Reduce NCCL verbosity
             "NCCL_DEBUG": "OFF",
-            
-            # ✨ ADD THIS: Force internal vLLM/PyTorch Distributed sockets to use localhost.
-            # This prevents broken pipes when memory snapshots are restored on containers with new IPs.
             "VLLM_HOST_IP": "127.0.0.1",
+            "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "1",
         }
+    )
+    # FIX: Patch vLLM to handle Mamba state (lists) during FP8 KV cache initialization on wake-up
+    .run_commands(
+        'python -c \'import sys; f="/usr/local/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py"; c=open(f).read(); c=c.replace("cache_tensor.zero_()", "[t.zero_() for t in cache_tensor if t is not None] if isinstance(cache_tensor, (list, tuple)) else cache_tensor.zero_()"); open(f,"w").write(c)\''
     )
     .run_function(download_model, secrets=[modal.Secret.from_name("hf-secret")])
 )
 
 app = modal.App("example-qwen3-5-9b-awq-inference")
 
+# Persists torch.compile cache across cold starts — saves ~155s per boot
+cache_vol = modal.Volume.from_name("vllm-compile-cache", create_if_missing=True)
+
 VLLM_PORT = 8000
 MINUTES = 60
 
-
 @app.cls(
     image=vllm_image,
-    gpu="T4", 
-    scaledown_window=180, 
+    gpu="L4",
+    scaledown_window=360,
     timeout=40 * MINUTES,
     secrets=[modal.Secret.from_name("hf-secret")],
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
+    volumes={"/cache": cache_vol},
 )
 @modal.concurrent(max_inputs=100)
 class VllmServer:
@@ -91,7 +86,7 @@ class VllmServer:
     def start(self):
         import requests
 
-        cmd =[
+        cmd = [
             "vllm",
             "serve",
             MODEL_PATH,
@@ -101,26 +96,35 @@ class VllmServer:
             "0.0.0.0",
             "--port",
             str(VLLM_PORT),
+            "--dtype",
+            "half",
+            "--kv-cache-dtype",
+            "fp8",
             "--max-model-len",
-            "8192",
+            "32768",
             "--gpu-memory-utilization",
-            "0.8",
+            "0.9156",               # Bumped per vLLM recommendation with CUDAGRAPHS estimator enabled
             "--mamba-cache-mode",
             "align",
             "--mamba-block-size",
-            "8",
+            "16",                   # Was 8 — reduces 10% KV cache padding waste
             "--max-num-batched-tokens",
-            "4096",
+            "4096",                 # Must be >= block_size (2096) in mamba align mode
             "--block-size",
             "32",
+            "--max-num-seqs",
+            "8",
             "--enable-prefix-caching",
-            "--mm-processor-cache-type", "shm",
+            "--generation-config",
+            "vllm",                 # Prevents model's generation_config.json from overriding sampling params
             "--disable-custom-all-reduce",
-            "--speculative-config", '{"method": "mtp", "num_speculative_tokens": 1}',
             "--default-chat-template-kwargs", '{"enable_thinking": false}',
+          "--mm-processor-cache-type", "shm",
             "--trust-remote-code",
             "--disable-log-stats",
             "--enable-sleep-mode",
+            # Removed --speculative-config: was forcing PIECEWISE cuda graph mode downgrade
+            # Removed --reasoning-parser: disabled thinking mode
         ]
 
         print("Starting vLLM server...")
@@ -157,7 +161,8 @@ class VllmServer:
 
     @modal.exit()
     def stop(self):
-        self.process.terminate()
+        if hasattr(self, "process"):
+            self.process.terminate()
 
     @modal.web_server(port=VLLM_PORT, startup_timeout=10 * MINUTES)
     def serve(self):

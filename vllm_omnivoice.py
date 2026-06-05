@@ -3,7 +3,7 @@ import subprocess
 import time
 import modal
 
-MODEL_NAME = "cyankiwi/Qwen3.5-4B-AWQ-4bit"
+MODEL_NAME = "k2-fsa/OmniVoice"
 MODEL_PATH = "/model"
 
 def download_model():
@@ -24,7 +24,7 @@ vllm_image = (
     .entrypoint([])
     .uv_pip_install(
         "vllm>=0.19.0",
-        "transformers>=4.56.0,<5",
+        "transformers>=4.57.0,<5",  # Use >=5.3.0 if you need voice cloning
         "requests",
         "huggingface_hub[hf_transfer]",
     )
@@ -33,44 +33,38 @@ vllm_image = (
             "HF_HUB_ENABLE_HF_TRANSFER": "1",
             "TORCHINDUCTOR_COMPILE_THREADS": "1",
             "VLLM_CACHE_ROOT": "/cache/vllm",
-            "TRITON_CACHE_DIR": "/tmp/triton",      # Fixed: moved off volume to prevent snapshot restore failure
+            "TRITON_CACHE_DIR": "/tmp/triton",
             "TORCH_NCCL_ENABLE_MONITORING": "0",
             "TORCH_NCCL_ASYNC_ERROR_HANDLING": "0",
             "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
             "NCCL_P2P_DISABLE": "1",
-            "VLLM_SERVER_DEV_MODE": "1",
             "NCCL_DEBUG": "OFF",
             "VLLM_HOST_IP": "127.0.0.1",
-            "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "1",
         }
-    )
-    # FIX: Patch vLLM to handle Mamba state (lists) during FP8 KV cache initialization on wake-up
-    .run_commands(
-        'python -c \'import sys; f="/usr/local/lib/python3.12/site-packages/vllm/v1/worker/gpu_model_runner.py"; c=open(f).read(); c=c.replace("cache_tensor.zero_()", "[t.zero_() for t in cache_tensor if t is not None] if isinstance(cache_tensor, (list, tuple)) else cache_tensor.zero_()"); open(f,"w").write(c)\''
     )
     .run_function(download_model, secrets=[modal.Secret.from_name("hf-secret")])
 )
 
-app = modal.App("example-qwen3-5-4b-awq-inference")
+app = modal.App("omnivoice-tts-inference")
 
-# Persists torch.compile cache across cold starts — saves ~155s per boot
-cache_vol = modal.Volume.from_name("vllm-compile-cache2", create_if_missing=True)
+cache_vol = modal.Volume.from_name("vllm-omnivoice-cache", create_if_missing=True)
 
-VLLM_PORT = 8000
+VLLM_PORT = 8091
 MINUTES = 60
+
 
 @app.cls(
     image=vllm_image,
     gpu="T4",
-    scaledown_window=240,
+    scaledown_window=300,
     timeout=40 * MINUTES,
     secrets=[modal.Secret.from_name("hf-secret")],
     enable_memory_snapshot=True,
     experimental_options={"enable_gpu_snapshot": True},
     volumes={"/cache": cache_vol},
 )
-@modal.concurrent(max_inputs=100)
-class VllmServer:
+@modal.concurrent(max_inputs=20)
+class OmniVoiceServer:
     def wait_ready(self):
         """Wait until vLLM server is responsive."""
         while True:
@@ -92,61 +86,38 @@ class VllmServer:
             MODEL_PATH,
             "--served-model-name",
             MODEL_NAME,
+            "--omni",                          # Required for OmniVoice
             "--host",
             "0.0.0.0",
             "--port",
             str(VLLM_PORT),
-            "--dtype",
-            "half",
-            "--kv-cache-dtype",
-            "fp8",
-            "--max-model-len",
-            "16384",
             "--gpu-memory-utilization",
-            "0.9156",               # Bumped per vLLM recommendation with CUDAGRAPHS estimator enabled
-            "--mamba-cache-mode",
-            "align",
-            "--mamba-block-size",
-            "16",                   # Was 8 — reduces 10% KV cache padding waste
-            "--max-num-batched-tokens",
-            "4096",                 # Must be >= block_size (2096) in mamba align mode
-            "--block-size",
-            "32",
-            "--max-num-seqs",
-            "8",
-            "--enable-prefix-caching",
-            "--enable-auto-tool-choice",
-            "--tool-call-parser",
-            "qwen3_coder",
-            "--generation-config",
-            "vllm",                 # Prevents model's generation_config.json from overriding sampling params
-            "--disable-custom-all-reduce",
-            "--default-chat-template-kwargs", '{"enable_thinking": false}',
-          "--mm-processor-cache-type", "shm",
+            "0.9",                             # Recommended default for OmniVoice
             "--trust-remote-code",
             "--disable-log-stats",
             "--enable-sleep-mode",
-            # Removed --speculative-config: was forcing PIECEWISE cuda graph mode downgrade
-            # Removed --reasoning-parser: disabled thinking mode
         ]
 
-        print("Starting vLLM server...")
+        print("Starting vLLM OmniVoice server...")
         self.process = subprocess.Popen(cmd)
 
         self.wait_ready()
         print("vLLM is up! Warming up...")
 
+        # Warmup with a basic TTS request
         warmup_payload = {
             "model": MODEL_NAME,
-            "messages": [{"role": "user", "content": "hi"}],
-            "max_tokens": 5,
+            "input": "Hello, how are you?",
+            "voice": "default",
+            "response_format": "wav",
         }
         try:
             requests.post(
-                f"http://127.0.0.1:{VLLM_PORT}/v1/chat/completions",
+                f"http://127.0.0.1:{VLLM_PORT}/v1/audio/speech",
                 json=warmup_payload,
                 timeout=300,
             ).raise_for_status()
+            print("Warmup complete!")
         except Exception as e:
             print(f"Warmup failed: {e}")
 

@@ -3,7 +3,7 @@ import subprocess
 import time
 import modal
 
-MODEL_NAME = "google/gemma-4-E2B-it"
+MODEL_NAME = "Intel/gemma-4-12B-it-int4-AutoRound"
 MODEL_PATH = "/model"
 
 def download_model():
@@ -16,6 +16,53 @@ def download_model():
         local_dir=MODEL_PATH,
         ignore_patterns=["*.pt", "*.bin"],
     )
+
+def write_patched_entrypoint():
+    """
+    Write a patched vLLM entrypoint that:
+      - Registers Gemma4UnifiedAssistantConfig into AutoModel (runs in every process,
+        including EngineCore subprocesses, because it is outside if __name__ == '__main__')
+      - Only calls vllm main() when this file is the top-level script, NOT when Python
+        re-imports it as __main__ inside a spawned child process.
+    """
+    script = (
+        "import sys\n"
+        "\n"
+        "# Register the assistant draft-model config so MTP speculative decoding works.\n"
+        "# This block intentionally runs in ALL processes (parent + spawned children)\n"
+        "# because each child re-imports this file and needs the mapping too.\n"
+        "try:\n"
+        "    from transformers.models.gemma4_unified_assistant"
+        ".configuration_gemma4_unified_assistant import Gemma4UnifiedAssistantConfig\n"
+        "    from transformers.models.gemma4_unified_assistant"
+        ".modeling_gemma4_unified_assistant import Gemma4UnifiedAssistantForCausalLM\n"
+        "    from transformers import AutoModel, AutoModelForCausalLM\n"
+        "    AutoModel.register(\n"
+        "        Gemma4UnifiedAssistantConfig,\n"
+        "        Gemma4UnifiedAssistantForCausalLM,\n"
+        "        exist_ok=True,\n"
+        "    )\n"
+        "    AutoModelForCausalLM.register(\n"
+        "        Gemma4UnifiedAssistantConfig,\n"
+        "        Gemma4UnifiedAssistantForCausalLM,\n"
+        "        exist_ok=True,\n"
+        "    )\n"
+        "    print('Registered Gemma4UnifiedAssistantConfig')\n"
+        "except Exception as exc:\n"
+        "    print('Warning: Gemma4UnifiedAssistantConfig registration:', exc)\n"
+        "\n"
+        "# IMPORTANT: guard main() so it only runs in the parent process.\n"
+        "# vLLM uses VLLM_WORKER_MULTIPROC_METHOD=spawn, which re-imports __main__\n"
+        "# in every child. Without this guard, each child tries to start vLLM again,\n"
+        "# triggering: 'An attempt has been made to start a new process before\n"
+        "# the current process has finished its bootstrapping phase.'\n"
+        "if __name__ == '__main__':\n"
+        "    from vllm.entrypoints.cli.main import main\n"
+        "    main()\n"
+    )
+    with open("/usr/local/bin/vllm_patched.py", "w") as f:
+        f.write(script)
+    print("Wrote /usr/local/bin/vllm_patched.py")
 
 vllm_image = (
     modal.Image.from_registry(
@@ -55,13 +102,15 @@ vllm_image = (
         # 2. Expand the audio mask to the TRUE length of the sequence
         'python -c \'import sys; f="/usr/local/lib/python3.12/site-packages/transformers/models/gemma4/modeling_gemma4.py"; c=open(f).read(); c=c.replace("hidden_states = hidden_states * mask[:, None, :, None]", "mask = torch.ones(hidden_states.shape[0], hidden_states.shape[2], dtype=torch.bool, device=hidden_states.device) if mask.dim() == 1 else mask; hidden_states = hidden_states * mask[:, None, :, None]"); open(f,"w").write(c)\'',
 
-        # 3. FIX: Cast audio encodings to match embed_audio weight dtype (bfloat16 vs float16 mismatch)
+        # 3. Cast audio encodings to match embed_audio weight dtype
         'python -c \'import sys; f="/usr/local/lib/python3.12/site-packages/vllm/model_executor/models/gemma4_mm.py"; c=open(f).read(); c=c.replace("audio_features = self.embed_audio(inputs_embeds=audio_encodings)", "audio_features = self.embed_audio(inputs_embeds=audio_encodings.to(next(self.embed_audio.parameters()).dtype))"); open(f,"w").write(c)\'',
     )
+    # 4. Write the patched vLLM entrypoint via a Python function (no shell-escaping issues)
+    .run_function(write_patched_entrypoint)
     .run_function(download_model, secrets=[modal.Secret.from_name("hf-secret")])
 )
 
-app = modal.App("example-gemma-4-e2b-it-inference")
+app = modal.App("example-gemma-4-e2b-Autoround-it-inference")
 
 cache_vol = modal.Volume.from_name("vllm-compile-cache6", create_if_missing=True)
 
@@ -96,7 +145,9 @@ class VllmServer:
         import requests
 
         cmd = [
-            "vllm",
+            # Patched entrypoint: registers Gemma4UnifiedAssistantConfig and
+            # guards main() behind if __name__ == '__main__' for spawn safety.
+            "python", "/usr/local/bin/vllm_patched.py",
             "serve",
             MODEL_PATH,
             "--served-model-name",
@@ -107,8 +158,6 @@ class VllmServer:
             str(VLLM_PORT),
             "--max-model-len",
             "32768",
-            "--dtype",
-            "half",
             "--kv-cache-dtype",
             "fp8",
             "--gpu-memory-utilization",
@@ -119,16 +168,21 @@ class VllmServer:
             "32",
             "--max-num-seqs",
             "8",
+            "--reasoning-parser", "gemma4",
             "--enable-prefix-caching",
             "--generation-config",
             "vllm",
             "--disable-custom-all-reduce",
             "--trust-remote-code",
             "--disable-log-stats",
+            "--enable-auto-tool-choice",
+            "--tool-call-parser", "gemma4",
             "--enable-sleep-mode",
+            "--enable-chunked-prefill",
             "--async-scheduling",
             "--default-chat-template-kwargs", '{"enable_thinking": false}',
-            "--limit-mm-per-prompt", '{"image": 0, "audio": 1}',
+            "--limit-mm-per-prompt", '{"image": 0, "audio": 0}',
+            "--speculative-config", '{"model":"google/gemma-4-12B-it-assistant","num_speculative_tokens":1}',
         ]
 
         print("Starting vLLM server...")

@@ -114,10 +114,6 @@ class VllmServer:
             "32",
             "--max-num-seqs",
             "8",
-            "--enable-prefix-caching",
-            "--enable-auto-tool-choice",
-            "--tool-call-parser",
-            "qwen3_coder",
             "--generation-config",
             "vllm",                 # Prevents model's generation_config.json from overriding sampling params
             "--disable-custom-all-reduce",
@@ -126,6 +122,8 @@ class VllmServer:
             "--trust-remote-code",
             "--disable-log-stats",
             "--enable-sleep-mode",
+            "--speculative-config",
+            '{"method":"mtp","num_speculative_tokens":2}',
             # Removed --speculative-config: was forcing PIECEWISE cuda graph mode downgrade
             # Removed --reasoning-parser: disabled thinking mode
         ]
